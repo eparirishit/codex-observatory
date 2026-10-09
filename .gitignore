@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+!.env.example
+*.jsonl
+*.jsonl.zst
+*.log
+*.jpg
+*.png
+VALIDATION.md
+*-redacted.json
+local-*
+.runtime/

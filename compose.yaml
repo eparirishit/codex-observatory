@@ -1,0 +1,33 @@
+name: codex-observatory
+services:
+  observatory:
+    build: .
+    restart: unless-stopped
+    init: true
+    user: "${LOCAL_UID:-501}:${LOCAL_GID:-20}"
+    ports:
+      - "127.0.0.1:${OBSERVATORY_PORT:-8765}:8765"
+    command: ["--container", "--codex-home", "/data/codex", "--public-port", "${OBSERVATORY_PORT:-8765}", "--link-file", "/tmp/observatory-link"]
+    volumes:
+      - type: bind
+        source: ${CODEX_SESSION_DIR:-${HOME}/.codex/sessions}
+        target: /data/codex/sessions
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import http.client,os; connection=http.client.HTTPConnection('127.0.0.1',8765,timeout=3); connection.request('GET','/healthz',headers={'Host':'127.0.0.1:'+os.environ.get('PUBLIC_PORT','8765')}); raise SystemExit(0 if connection.getresponse().status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    environment:
+      PUBLIC_PORT: ${OBSERVATORY_PORT:-8765}
