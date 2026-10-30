@@ -1,11 +1,13 @@
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest.mock import patch
 
 from observatory import Observatory, make_handler, number, parse_session, summarize
 
@@ -149,6 +151,84 @@ class LogTests(unittest.TestCase):
         self.assertEqual(snapshot['coverage']['compressed_skipped'], 1)
         self.assertEqual(snapshot['coverage']['invalid_lines'], 2)
 
+    def test_compressed_logs_stream_frames_and_merge_with_readable_logs(self):
+        self.write(self.base())
+        record = event('token_usage_record', {'response_id': 'compressed-response', 'turn_id': 'turn-one', 'usage': usage()}, 3)
+        frames = [self.path.read_bytes(), (json.dumps(record) + '\n' + 'x' * 1025 + '\n{unfinished').encode()]
+        compressed = b''.join(subprocess.run(['zstd', '-q', '-c'], input=frame, capture_output=True, check=True).stdout for frame in frames)
+        archives = self.root / 'archived_sessions'
+        archives.mkdir()
+        archive = archives / 'history.jsonl.zst'
+        archive.write_bytes(compressed)
+        reader = Observatory(self.root)
+        with patch('observatory.MAX_LINE', 1024):
+            first = reader.snapshot()
+        self.assertEqual(first['coverage']['log_files'], 2)
+        self.assertEqual(first['coverage']['sessions'], 1)
+        self.assertEqual(first['coverage']['compressed_skipped'], 0)
+        self.assertEqual(first['coverage']['invalid_lines'], 2)
+        self.assertEqual(first['summary']['usage']['total_tokens'], 120)
+        self.assertNotIn('PRIVATE_PROMPT', json.dumps(first))
+        self.assertEqual(reader.snapshot()['summary']['usage']['total_tokens'], 120)
+        self.assertEqual(archive.read_bytes(), compressed)
+        self.write(self.base() + [record])
+        self.assertEqual(reader.snapshot()['summary']['usage']['total_tokens'], 120)
+
+    def test_failed_compressed_reads_do_not_publish_partial_metrics(self):
+        self.write(self.base())
+        compressed = subprocess.run(['zstd', '-q', '-c'], input=self.path.read_bytes(), capture_output=True, check=True).stdout
+        archive = self.logs / 'history.jsonl.zst'
+        archive.write_bytes(compressed[:-1])
+        snapshot = Observatory(self.root).snapshot()
+        self.assertEqual(snapshot['coverage']['log_files'], 1)
+        self.assertEqual(snapshot['coverage']['unreadable_files'], 1)
+        self.assertEqual(snapshot['coverage']['compressed_skipped'], 1)
+        archive.write_bytes(compressed)
+        with patch('observatory.subprocess.Popen', side_effect=FileNotFoundError):
+            snapshot = Observatory(self.root).snapshot()
+        self.assertEqual(snapshot['coverage']['log_files'], 1)
+        self.assertEqual(snapshot['coverage']['compressed_skipped'], 1)
+
+    def test_collaboration_executions_preserve_outcomes_and_redaction(self):
+        events = self.base()
+        for second, status in ((3, 'completed'), (4, 'failed')):
+            events.append(event('event_msg', {'type': 'item_completed', 'turn_id': 'turn-one',
+                          'started_at_ms': 100, 'completed_at_ms': 350,
+                          'item': {'type': 'CollabAgentToolCall', 'id': f'collab-{second}',
+                                   'tool': 'spawn_agent', 'status': status, 'prompt': 'PRIVATE_PROMPT',
+                                   'sender_thread_id': 'PRIVATE_SENDER', 'receiver_thread_ids': ['PRIVATE_RECEIVER'],
+                                   'agents_states': {'PRIVATE_RECEIVER': {'message': 'PRIVATE_RESULT'}}}}, second))
+        self.write(events)
+        snapshot = Observatory(self.root).snapshot()
+        calls = snapshot['sessions'][0]['calls']
+        self.assertEqual([call['status'] for call in calls], ['completed', 'failed'])
+        self.assertEqual([call['duration_ms'] for call in calls], [250, 250])
+        self.assertEqual(calls[0]['name'], 'subagent.spawn_agent')
+        self.assertEqual(calls[0]['category'], 'subagent')
+        self.assertEqual(snapshot['summary']['tools'][0]['failed'], 1)
+        self.assertNotIn('PRIVATE_', json.dumps(snapshot))
+
+    def test_turn_abort_events_end_running_turns(self):
+        for subtype in ('task_aborted', 'turn_aborted'):
+            with self.subTest(subtype=subtype):
+                self.write(self.base() + [event('event_msg', {'type': subtype, 'turn_id': 'turn-one'}, 4)])
+                turn = parse_session(self.path)['turns'][0]
+                self.assertEqual(turn['status'], 'aborted')
+                self.assertEqual(turn['duration_seconds'], 3)
+
+    def test_unknown_nested_events_are_visible_without_warning_on_known_messages(self):
+        self.write(self.base() + [
+            event('response_item', {'type': 'message', 'content': 'PRIVATE_PROMPT'}, 3),
+            event('event_msg', {'type': 'item_completed', 'item': {'type': 'AgentMessage', 'id': 'message'}}, 4),
+            event('event_msg', {'type': 'future_event', 'content': 'PRIVATE_EVENT'}, 5),
+            event('response_item', {'type': 'future_tool_call', 'arguments': 'PRIVATE_ARGUMENTS'}, 6),
+            event('event_msg', {'type': 'item_completed', 'item': {'type': 'FutureToolCall', 'id': 'future'}}, 7)])
+        snapshot = Observatory(self.root).snapshot()
+        self.assertEqual(snapshot['sessions'][0]['unknown_events'], 3)
+        self.assertEqual(snapshot['coverage']['unknown_events'], 3)
+        self.assertEqual(len(snapshot['sessions'][0]['warnings']), 1)
+        self.assertNotIn('PRIVATE_', json.dumps(snapshot))
+
     def test_session_segments_merge_without_duplicate_rows_or_tokens(self):
         self.write(self.base() + [event('token_usage_record', {'response_id': 'response-one', 'turn_id': 'turn-one', 'usage': usage()}, 3)])
         (self.logs / 'copy.jsonl').write_bytes(self.path.read_bytes())
@@ -159,6 +239,67 @@ class LogTests(unittest.TestCase):
         self.assertEqual(first['coverage']['sessions'], 1)
         self.assertEqual(first['summary']['usage']['total_tokens'], 120)
         self.assertEqual(second['sessions'][0]['turns'][0]['responses'], 1)
+
+    def test_call_completion_survives_overlapping_segments_and_stale_copies(self):
+        pending = self.base() + [event('response_item', {'type': 'function_call', 'name': 'exec', 'call_id': 'call-one', 'arguments': '{}'}, 3)]
+        self.write(pending)
+        finished = pending + [event('response_item', {'type': 'function_call_output', 'call_id': 'call-one', 'output': 'PRIVATE_OUTPUT'}, 5),
+                              event('event_msg', {'type': 'task_complete', 'turn_id': 'turn-one'}, 6)]
+        (self.logs / 'finished.jsonl').write_text(''.join(json.dumps(item) + '\n' for item in finished))
+        stale = pending + [event('response_item', {'type': 'message'}, 9)]
+        (self.logs / 'stale.jsonl').write_text(''.join(json.dumps(item) + '\n' for item in stale))
+        reader = Observatory(self.root)
+        for _ in range(2):
+            snapshot = reader.snapshot()
+            session = snapshot['sessions'][0]
+            self.assertEqual(len(session['calls']), 1)
+            self.assertEqual(session['calls'][0]['status'], 'returned')
+            self.assertEqual(session['calls'][0]['duration_ms'], 2000)
+            self.assertEqual(session['calls'][0]['ended_at'], '2026-10-08T12:00:05+00:00')
+            self.assertEqual(session['turns'][0]['status'], 'completed')
+            self.assertNotIn('PRIVATE_OUTPUT', json.dumps(snapshot))
+
+    def test_output_in_separate_segment_completes_call(self):
+        self.write(self.base() + [event('response_item', {'type': 'function_call', 'name': 'exec', 'call_id': 'call-one', 'arguments': '{}'}, 3)])
+        output = self.base() + [event('response_item', {'type': 'function_call_output', 'call_id': 'call-one', 'output': 'PRIVATE_OUTPUT'}, 5)]
+        (self.logs / 'output.jsonl').write_text(''.join(json.dumps(item) + '\n' for item in output))
+        call = Observatory(self.root).snapshot()['sessions'][0]['calls'][0]
+        self.assertEqual(call['status'], 'returned')
+        self.assertEqual(call['duration_ms'], 2000)
+
+    def test_merged_call_duration_uses_earliest_start(self):
+        for name, start in (('first.jsonl', 3), ('later.jsonl', 4)):
+            events = self.base() + [event('response_item', {'type': 'function_call', 'name': 'exec', 'call_id': 'call-one'}, start),
+                                    event('response_item', {'type': 'function_call_output', 'call_id': 'call-one'}, 5)]
+            if start == 4:
+                events.append(event('response_item', {'type': 'message'}, 6))
+            (self.logs / name).write_text(''.join(json.dumps(item) + '\n' for item in events))
+        call = Observatory(self.root).snapshot()['sessions'][0]['calls'][0]
+        self.assertEqual(call['duration_ms'], 2000)
+
+    def test_execution_updates_preserve_terminal_state_and_timing(self):
+        events = self.base()
+        for second, status in ((3, 'in_progress'), (5, 'failed'), (6, 'in_progress')):
+            item = {'type': 'McpToolCall', 'id': 'mcp-one', 'server': 'example', 'tool': 'read', 'arguments': {'key': 'value'}, 'status': status}
+            payload = {'type': 'item_completed', 'turn_id': 'turn-one', 'item': item}
+            if status == 'failed':
+                payload.update(started_at_ms=100, completed_at_ms=350)
+            events.append(event('event_msg', payload, second))
+        self.write(events)
+        session = parse_session(self.path)
+        self.assertEqual(len(session['calls']), 1)
+        self.assertEqual(session['calls'][0]['status'], 'failed')
+        self.assertEqual(session['calls'][0]['duration_ms'], 250)
+        self.assertEqual(session['turns'][0]['failed_calls'], 1)
+        self.assertEqual(session['turns'][0]['repeated_calls'], 0)
+
+    def test_replayed_turn_start_does_not_replace_terminal_state(self):
+        self.write(self.base() + [event('event_msg', {'type': 'task_complete', 'turn_id': 'turn-one'}, 5),
+                                  event('event_msg', {'type': 'task_started', 'turn_id': 'turn-one'}, 6),
+                                  event('event_msg', {'type': 'task_complete', 'turn_id': 'turn-one'}, 4)])
+        turn = parse_session(self.path)['turns'][0]
+        self.assertEqual(turn['status'], 'completed')
+        self.assertEqual(turn['duration_seconds'], 4)
 
     def test_invalid_numeric_and_item_types_do_not_break_other_metrics(self):
         self.assertIsNone(number(10 ** 400))
@@ -200,7 +341,11 @@ class ServerTests(unittest.TestCase):
                 with urlopen(address + '/') as response:
                     self.assertIn(b'Codex Observatory', response.read())
                     self.assertIn("connect-src 'self'", response.headers['Content-Security-Policy'])
+                    self.assertIn("font-src 'self'", response.headers['Content-Security-Policy'])
                     self.assertEqual(response.headers['Cache-Control'], 'no-store')
+                with urlopen(address + '/fonts/geist.woff2') as response:
+                    self.assertEqual(response.headers['Content-Type'], 'font/woff2')
+                    self.assertEqual(response.read(4), b'wOF2')
                 for path, headers, expected in [('/api/snapshot', {}, 401),
                                                 ('/api/snapshot', {'X-Observatory-Token': 'wrong'}, 401),
                                                 ('/api/snapshot', {'X-Observatory-Token': 'test-token', 'Origin': 'https://evil.example'}, 403),

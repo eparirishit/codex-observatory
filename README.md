@@ -1,6 +1,6 @@
 # Codex Observatory
 
-A local, privacy-first dashboard for understanding Codex Desktop activity. Run it in the background with Docker Desktop or directly with Python. No AI APIs, telemetry, uploads, external assets, or runtime packages.
+A local, privacy-first dashboard for understanding Codex Desktop activity. Run it in the background with Docker Desktop or directly with Python. No AI APIs, telemetry, uploads, external assets, or Python runtime packages. Compressed history uses the `zstd` command, included in the Docker image.
 
 ## Run in the background on macOS
 
@@ -42,7 +42,7 @@ docker compose exec -T observatory cat /tmp/observatory-link
 
 ## Run without Docker
 
-Python 3.11 or later, with no package installation:
+Python 3.11 or later. Install the `zstd` command to read compressed history (`brew install zstd` on macOS); no Python packages are needed:
 
 ```sh
 python3 observatory.py
@@ -71,7 +71,7 @@ Older logs use cumulative deltas. Duplicate snapshots add no tokens. Initial sna
 
 Response input is a context proxy, not precise live occupancy. It cannot isolate tokens attributable to prompts, plugins, files, or tool definitions. Compactions use committed `compacted` checkpoints, excluding mirrored items.
 
-Repeated identical commands/arguments within a turn are retry **candidates**, including intentional polling. Explicit status, shell exit code, and MCP `isError` establish failures. A wrapper returning only establishes that output arrived. Durations can overlap and do not add to wall time.
+Repeated identical commands/arguments within a turn are retry **candidates**, including intentional polling. Explicit status, shell exit code, and MCP `isError` establish failures. Collaboration tool executions preserve their recorded status and duration; aborted turns are ended. A wrapper returning only establishes that output arrived. Overlapping log segments retain terminal results and join calls with outputs recorded in another segment. Durations can overlap and do not add to wall time.
 
 Approval subagents are identified by recorded model `codex-auto-review`. Their tokens appear separately; subscription treatment is unknown. Main-session totals do not automatically include child sessions.
 
@@ -88,7 +88,7 @@ Account percentages are historical account-level observations that may include o
 
 ## Coverage and limits
 
-The parser supports observed Codex schemas, not a guaranteed stable API. Compressed `.jsonl.zst` archives are counted but skipped. Source symlinks are skipped. Malformed, partial, oversized (>16 MiB), or unknown records generate coverage warnings; a later refresh can recover an unfinished append.
+The parser supports observed Codex schemas, not a guaranteed stable API. Compressed `.jsonl.zst` archives are streamed read-only through the same parser, including archived sessions in native mode. A missing `zstd` command or a corrupt archive is counted as an unreadable file and a skipped compressed archive; partial metrics from failed decoding are discarded. Source symlinks are skipped. Malformed, partial, oversized (>16 MiB), or unknown records generate coverage warnings; unsupported event and item types also appear in the coverage totals. A later refresh can recover an unfinished append.
 
 Hidden platform work, cloud activity absent from local logs, plugin overhead, tool token charges, precise live context occupancy, and exact subscription accounting are unavailable.
 

@@ -13,3 +13,7 @@ VALIDATION.md
 *-redacted.json
 local-*
 .runtime/
+
+.playwright-cli/
+
+output/playwright/

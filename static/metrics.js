@@ -7,9 +7,9 @@ const ObservatoryMetrics = {
     const output = usage.output_tokens;
     if ([input, cached, output].some(value => !Number.isFinite(value) || value < 0) || cached > input) return null;
     return [
-      { label: 'Reused input', value: cached, color: '#82e3c0' },
-      { label: 'Fresh input', value: input - cached, color: '#aa9aff' },
-      { label: 'Generated output', value: output, color: '#f4c47d' }
+      { label: 'Reused input', value: cached, color: '#5fd39a' },
+      { label: 'Fresh input', value: input - cached, color: '#519dfa' },
+      { label: 'Generated output', value: output, color: '#d4a35b' }
     ];
   },
   dailyUsage(sessions) {

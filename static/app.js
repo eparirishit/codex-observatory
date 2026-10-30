@@ -88,7 +88,7 @@ function renderVisuals() {
   if (parts) {
     const total = parts.reduce((sum, part) => sum + part.value, 0);
     const svg = svgElement('svg', {viewBox:'0 0 220 220',role:'img','aria-label':parts.map(part => `${part.label}: ${format(part.value)} tokens`).join('. ')});
-    svg.append(svgElement('circle', {cx:110,cy:110,r:82,fill:'none',stroke:'#30394c','stroke-width':25}));
+    svg.append(svgElement('circle', {cx:110,cy:110,r:82,fill:'none',stroke:'var(--line)','stroke-width':25}));
     let offset = 0;
     for (const part of parts) {
       const length = total ? part.value / total * 100 : 0;
@@ -112,9 +112,9 @@ function renderVisuals() {
   if (shown.length) {
     const max = Math.max(1,...shown.map(day=>day.tokens));
     const svg = svgElement('svg',{viewBox:'0 0 640 220',role:'img','aria-label':`Recorded tokens by turn start date. ${shown.length} dates shown. Exact totals in the table.`});
-    [0,0.5,1].forEach(fraction=>{ const top = 178-fraction*150; svg.append(svgElement('line',{x1:57,y1:top,x2:630,y2:top,stroke:'#30394c'})); const text=svgElement('text',{x:48,y:top+4,'text-anchor':'end',class:'axis-label'}); text.textContent=compact(max*fraction); svg.append(text); });
+    [0,0.5,1].forEach(fraction=>{ const top = 178-fraction*150; svg.append(svgElement('line',{x1:57,y1:top,x2:630,y2:top,stroke:'var(--line)'})); const text=svgElement('text',{x:48,y:top+4,'text-anchor':'end',class:'axis-label'}); text.textContent=compact(max*fraction); svg.append(text); });
     const step=570/shown.length;
-    shown.forEach((day,index)=>{ const height=day.tokens/max*150; const bar=svgElement('rect',{x:60+index*step+step*.18,y:178-height,width:step*.64,height:Math.max(1,height),rx:4,fill:'#aa9aff'});const title=svgElement('title');title.textContent=`${day.date}: ${format(day.tokens)} tokens, ${day.turns} turns`;bar.append(title);svg.append(bar);
+    shown.forEach((day,index)=>{ const height=day.tokens/max*150; const bar=svgElement('rect',{x:60+index*step+step*.18,y:178-height,width:step*.64,height:Math.max(1,height),rx:4,fill:'var(--accent)'});const title=svgElement('title');title.textContent=`${day.date}: ${format(day.tokens)} tokens, ${day.turns} turns`;bar.append(title);svg.append(bar);
       if (index%Math.max(1,Math.ceil(shown.length/7))===0 || index===shown.length-1) { const text=svgElement('text',{x:60+index*step+step*.5,y:204,'text-anchor':'middle',class:'axis-label'});text.textContent=day.date.slice(5);svg.append(text); }
     });
     chart.append(svg);
@@ -247,7 +247,7 @@ function renderDetail() {
   }
   line.setAttribute('points', coordinates.join(' '));
   line.setAttribute('fill', 'none');
-  line.setAttribute('stroke', '#8ce8ca');
+  line.setAttribute('stroke', 'var(--accent)');
   line.setAttribute('stroke-width', '2');
   line.setAttribute('vector-effect', 'non-scaling-stroke');
   svg.append(line);
@@ -300,7 +300,7 @@ function render() {
   renderTools();
   renderDetail();
   const coverage = snapshot.coverage;
-  byId('coverage').textContent = `${coverage.sessions} sessions across ${coverage.log_files} readable log files · ${coverage.compressed_skipped} compressed archives skipped · ${coverage.unreadable_files} unreadable files · ${coverage.invalid_lines} skipped lines · ${summary.compactions} committed compactions · ${summary.duplicate_responses} cross-session response duplicates excluded.`;
+  byId('coverage').textContent = `${coverage.sessions} sessions across ${coverage.log_files} readable log files · ${coverage.compressed_skipped} compressed archives skipped · ${coverage.unreadable_files} unreadable files · ${coverage.invalid_lines} skipped lines · ${coverage.unknown_events} unsupported events or items · ${summary.compactions} committed compactions · ${summary.duplicate_responses} cross-session response duplicates excluded.`;
   const config = snapshot.config;
   byId('config').textContent = config.status === 'measured' ? `Configured default: ${config.model} · reasoning: ${config.reasoning_effort} · service: ${config.service_tier}. MCP servers: ${config.mcp_servers.map(server => `${server.name} (${server.enabled ? 'enabled' : 'disabled'})`).join(', ') || 'none'} · ${config.plugin_count ?? '—'} plugin entries. Config defaults can differ from the model recorded in a turn.` : 'Configuration could not be read; log metrics remain available.';
   byId('status').textContent = `Updated ${date(snapshot.generated_at)} · read-only access · memory storage · no AI calls`;

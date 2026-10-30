@@ -3,6 +3,7 @@
 
 import argparse
 import collections
+from contextlib import contextmanager
 import datetime as dt
 import hashlib
 import json
@@ -11,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import tomllib
@@ -120,6 +122,20 @@ def read_config(root):
     return result
 
 
+@contextmanager
+def session_stream(path):
+    if path.suffix != '.zst':
+        with path.open('rb') as stream:
+            yield stream
+        return
+    with subprocess.Popen(['zstd', '-q', '-d', '-c', '-M128MB', '--', str(path)],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        with process.stdout as stream:
+            yield stream
+        if process.wait() != 0:
+            raise OSError('Compressed log could not be decoded.')
+
+
 def parse_session(path):
     session = {'id': identifier(str(path)), 'parent_id': None, 'kind': 'main',
                'started_at': None, 'updated_at': None, 'models': [], 'turns': [],
@@ -164,11 +180,11 @@ def parse_session(path):
         call = {'at': at, 'turn_id': turn_id, 'name': label(name, 'redacted'),
                 'category': category, 'status': status, 'duration_ms': duration_ms,
                 'output_bytes': output_bytes, 'repeat_candidate': repeated,
-                'id': item_id}
+                'id': item_id, 'ended_at': at if status in ('completed', 'failed', 'cancelled') else None}
         session['calls'].append(call)
         return call
 
-    with path.open('rb') as stream:
+    with session_stream(path) as stream:
         while True:
             line = stream.readline(MAX_LINE + 1)
             if not line:
@@ -228,12 +244,14 @@ def parse_session(path):
                 if subtype == 'task_started':
                     current_turn = identifier(payload.get('turn_id')) or current_turn
                     turn = turn_for(payload.get('turn_id'), at)
-                    turn.update(started_at=timestamp(payload.get('started_at')) or at, status='running')
+                    if turn['status'] not in ('completed', 'failed', 'aborted'):
+                        turn.update(started_at=timestamp(payload.get('started_at')) or at, status='running')
                     context_window = number(payload.get('model_context_window')) or context_window
-                elif subtype in ('task_complete', 'task_aborted'):
+                elif subtype in ('task_complete', 'task_aborted', 'turn_aborted'):
                     turn = turn_for(payload.get('turn_id'), at)
-                    turn.update(ended_at=timestamp(payload.get('completed_at')) or at,
-                                status='failed' if payload.get('error') else 'aborted' if subtype == 'task_aborted' else 'completed')
+                    turn.update(merge_lifecycle(turn, {
+                        'ended_at': timestamp(payload.get('completed_at')) or at,
+                        'status': 'failed' if payload.get('error') else 'aborted' if subtype in ('task_aborted', 'turn_aborted') else 'completed'}))
                 elif subtype == 'token_count':
                     info = object_value(payload.get('info'))
                     limits = snapshot_limits(payload.get('rate_limits'), at)
@@ -271,8 +289,7 @@ def parse_session(path):
                     item_type = label(item.get('type'))
                     item_id = identifier(item.get('id'))
                     dedup_key = (item_type, item_id)
-                    if item_id and dedup_key in seen_items:
-                        continue
+                    duplicate_item = item_id and dedup_key in seen_items
                     seen_items.add(dedup_key)
                     turn = turn_for(payload.get('turn_id'), at)
                     start_ms = number(payload.get('started_at_ms'))
@@ -286,7 +303,7 @@ def parse_session(path):
                             status = 'completed' if exit_code == 0 else 'failed'
                         output = item.get('aggregated_output')
                         output_size = len(output.encode()) if isinstance(output, str) else None
-                        fingerprint = argument_fingerprint(item.get('command'))
+                        fingerprint = None if duplicate_item else argument_fingerprint(item.get('command'))
                         add_call('shell.command', 'shell', at, turn['id'], status, duration, output_size, fingerprint, item_id)
                     elif item_type == 'McpToolCall':
                         name = label(item.get('server'), 'redacted') + '/' + label(item.get('tool'), 'redacted')
@@ -294,16 +311,21 @@ def parse_session(path):
                         if result.get('isError') is True or item.get('error'):
                             status = 'failed'
                         add_call(name, 'mcp', at, turn['id'], status, duration,
-                                 fingerprint=argument_fingerprint(item.get('arguments')), item_id=item_id)
+                                 fingerprint=None if duplicate_item else argument_fingerprint(item.get('arguments')), item_id=item_id)
                     elif item_type in ('FileChange', 'ImageView', 'Extension'):
                         add_call({'FileChange': 'file.change', 'ImageView': 'image.view', 'Extension': 'extension.' + label(item.get('kind'), 'unknown')}[item_type],
                                  'local' if item_type != 'Extension' else 'extension', at, turn['id'], status, duration, item_id=item_id)
-                    elif item_type == 'SubAgentActivity':
-                        add_call('subagent.' + label(item.get('kind'), 'activity'), 'subagent', at, turn['id'], item_id=item_id)
+                    elif item_type in ('SubAgentActivity', 'CollabAgentToolCall'):
+                        name = item.get('tool') if item_type == 'CollabAgentToolCall' else item.get('kind')
+                        add_call('subagent.' + label(name, 'activity'), 'subagent', at, turn['id'], status, duration, item_id=item_id)
+                    elif item_type not in ('UserMessage', 'AgentMessage', 'Reasoning', 'ContextCompaction', 'EnteredReviewMode', 'ExitedReviewMode'):
+                        session['unknown_events'] += 1
                 elif subtype == 'thread_settings_applied':
                     settings = object_value(payload.get('thread_settings'))
                     current_model = label(settings.get('model'), current_model)
                     current_effort = label(settings.get('reasoning_effort'), current_effort)
+                elif subtype not in ('user_message', 'agent_message', 'agent_reasoning'):
+                    session['unknown_events'] += 1
             elif kind == 'response_item':
                 metadata = object_value(payload.get('internal_chat_message_metadata_passthrough'))
                 turn = turn_for(metadata.get('turn_id'), at) if subtype in ('function_call', 'custom_tool_call') else None
@@ -321,7 +343,9 @@ def parse_session(path):
                     if call_id:
                         outer_calls[call_id] = call
                 elif subtype in ('function_call_output', 'custom_tool_call_output'):
-                    output_events.append((identifier(payload.get('call_id')), at))
+                    output_events.append({'id': identifier(payload.get('call_id')), 'at': at})
+                elif subtype not in ('message', 'reasoning', 'compaction'):
+                    session['unknown_events'] += 1
             elif kind == 'compacted':
                 turn = turn_for(at=at)
                 session['compactions'].append({'at': at, 'turn_id': turn['id'],
@@ -329,12 +353,7 @@ def parse_session(path):
             elif kind not in ('world_state', 'inter_agent_communication_metadata'):
                 session['unknown_events'] += 1
 
-    for call_id, at in output_events:
-        call = outer_calls.get(call_id)
-        if call:
-            call['status'] = 'returned'
-            duration = seconds_between(call['at'], at)
-            call['duration_ms'] = duration * 1000 if duration is not None else None
+    session['_call_outputs'] = output_events
     selected_records = records or fallback_records
     session['usage_source'] = 'token_usage_record' if records else 'cumulative_delta' if fallback_records else 'unavailable'
     session['_records'] = selected_records
@@ -348,12 +367,40 @@ def parse_session(path):
     if session['invalid_lines']:
         session['warnings'].append('Malformed, oversized, or unfinished lines were skipped; refresh after active writes.')
     if session['unknown_events']:
-        session['warnings'].append('Unknown event types were ignored; metrics may be incomplete for newer schemas.')
+        session['warnings'].append('Unknown event or item types were ignored; metrics may be incomplete for newer schemas.')
     recalculate_session(session)
     return session
 
 
+def merge_lifecycle(previous, current):
+    def rank(item):
+        return (item.get('status') in ('completed', 'failed', 'cancelled', 'returned', 'aborted'),
+                item.get('ended_at') or item.get('at') or '')
+    if rank(previous) > rank(current):
+        previous, current = current, previous
+    merged = {**previous, **{key: value for key, value in current.items() if value is not None}}
+    for key in ('at', 'started_at'):
+        if key in merged:
+            merged[key] = min((item[key] for item in (previous, current) if item.get(key)), default=None)
+    if 'repeat_candidate' in merged:
+        merged['repeat_candidate'] = previous['repeat_candidate'] or current['repeat_candidate']
+    return merged
+
+
 def recalculate_session(session):
+    calls = {}
+    for index, call in enumerate(session['calls']):
+        key = (call['category'], call['id']) if call['id'] else (None, index)
+        calls[key] = merge_lifecycle(calls[key], call) if key in calls else dict(call)
+    for output in session['_call_outputs']:
+        if not output['id']:
+            continue
+        call = calls.get(('wrapper', output['id'])) or calls.get(('agent_tool', output['id']))
+        if call and (not call['ended_at'] or (output['at'] and output['at'] >= call['ended_at'])):
+            call.update(status='returned', ended_at=output['at'])
+            duration = seconds_between(call['at'], output['at'])
+            call['duration_ms'] = duration * 1000 if duration is not None else None
+    session['calls'] = sorted(calls.values(), key=lambda call: call['at'] or '')
     session['usage'] = empty_usage()
     turns = {turn['id']: turn for turn in session['turns']}
     for turn in turns.values():
@@ -395,17 +442,16 @@ def merge_sessions(sessions):
                 if turn['id'] not in turn_map:
                     turn_map[turn['id']] = dict(turn)
                 else:
-                    existing = turn_map[turn['id']]
-                    existing.update({key: value for key, value in turn.items() if value is not None and key != 'started_at'})
+                    turn_map[turn['id']] = merge_lifecycle(turn_map[turn['id']], turn)
         merged['turns'] = sorted(turn_map.values(), key=lambda turn: turn['started_at'] or '')
         for index, turn in enumerate(merged['turns'], 1):
             turn['number'] = index
-        for field in ('_records', 'calls', 'context', 'compactions', 'rate_limits'):
+        for field in ('_records', '_call_outputs', 'calls', 'context', 'compactions', 'rate_limits'):
             seen = set()
             merged[field] = []
             for session in group:
                 for item in session[field]:
-                    key = item.get('id') if field == '_records' else (item.get('category'), item.get('id')) if field == 'calls' and item.get('id') else json.dumps(item, sort_keys=True)
+                    key = item.get('id') if field == '_records' else None if field == 'calls' else json.dumps(item, sort_keys=True)
                     if key is not None and key in seen:
                         continue
                     if key is not None:
@@ -508,8 +554,8 @@ class Observatory:
                 directory = self.root / name
                 if directory.is_symlink():
                     continue
-                compressed += len(list(directory.rglob('*.jsonl.zst')))
-                paths.extend(path for path in directory.rglob('*.jsonl') if not path.is_symlink())
+                for pattern in ('*.jsonl', '*.jsonl.zst'):
+                    paths.extend(path for path in directory.rglob(pattern) if not path.is_symlink())
             active = set(paths)
             self.cache = {path: value for path, value in self.cache.items() if path in active}
             for path in paths:
@@ -522,6 +568,7 @@ class Observatory:
                         self.cache[path] = (signature, parse_session(path))
                 except (OSError, ValueError, RecursionError):
                     unreadable += 1
+                    compressed += int(path.suffix == '.zst')
                     self.cache.pop(path, None)
             sessions = merge_sessions([value[1] for value in self.cache.values()])
             summary = summarize(sessions)
@@ -529,6 +576,7 @@ class Observatory:
             return {'generated_at': dt.datetime.now(dt.timezone.utc).isoformat(),
                     'privacy': 'Loopback only. Prompts, commands, arguments, outputs, paths, and secrets excluded. Memory storage.',
                     'coverage': {'sessions': len(sessions), 'log_files': len(self.cache), 'compressed_skipped': compressed, 'unreadable_files': unreadable,
+                                 'unknown_events': sum(session['unknown_events'] for session in sessions),
                                  'invalid_lines': sum(session['invalid_lines'] for session in sessions)},
                     'config': read_config(self.root), 'summary': summary, 'sessions': public_sessions}
 
@@ -545,7 +593,7 @@ def make_handler(observatory, access_token, public_port=None):
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
-            self.send_header('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+            self.send_header('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
             self.end_headers()
             self.wfile.write(body)
 
@@ -579,7 +627,8 @@ def make_handler(observatory, access_token, public_port=None):
                      '/dashboard.css': ('dashboard.css', 'text/css; charset=utf-8'),
                      '/metrics.js': ('metrics.js', 'text/javascript; charset=utf-8'),
                      '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
-                     '/style.css': ('style.css', 'text/css; charset=utf-8')}
+                     '/style.css': ('style.css', 'text/css; charset=utf-8'),
+                     '/fonts/geist.woff2': ('fonts/geist.woff2', 'font/woff2')}
             if route not in files:
                 self.send_body(404, b'Not found', 'text/plain')
                 return
