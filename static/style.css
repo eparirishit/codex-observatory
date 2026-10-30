@@ -125,3 +125,19 @@ code { font-size: 12px; }
   select { max-width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) { button, select { transition: none; } }
+
+.reading-guide { padding: 16px 20px; }
+.reading-guide summary { color: var(--text); font-size: 13px; }
+.reading-guide summary span { margin-left: 12px; }
+.reading-guide ol { margin: 20px 0 0; padding-left: 24px; color: var(--muted); font-size: 13px; line-height: 1.75; }
+.reading-guide li { margin: 12px 0; padding-left: 8px; }
+.reading-guide strong { color: var(--text); font-weight: 500; }
+.execution-cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 600px) { .execution-cards { grid-template-columns: minmax(0, 1fr); } }
+
+textarea, .project-label { width: 100%; max-width: 100%; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px; font: inherit; font-size: 12px; }
+textarea { display: block; margin: 12px 0; resize: vertical; min-height: 100px; }
+textarea:focus-visible, .project-label:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+a { color: var(--accent); }
+.project-label { min-width: 120px; }
+#cost-overview { margin-bottom: 12px; }

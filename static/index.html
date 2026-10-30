@@ -17,6 +17,21 @@
   <main>
     <p id="status" role="status" aria-live="polite">Reading local metrics…</p>
     <div id="auth-help" class="notice" hidden>Open the complete link printed by the running observatory, including its access token. The token stays in this tab’s memory.</div>
+    <details id="how-to-read" class="panel reading-guide">
+      <summary>How to read this <span class="subtle">Measurement notes 1–10</span></summary>
+      <ol>
+        <li id="note-1"><strong>Tokens and allowance.</strong> Cached input is part of input; reasoning is part of output. The composition chart splits cached input, fresh input, and generated output without overlap. Missing counters show as —. Recorded tokens measure activity, not subscription quota; exact subscription charges, per-tool token costs, and plugin instruction overhead remain unavailable. API-equivalent estimates are separate (note 8).</li>
+        <li id="note-2"><strong>Repeat candidates.</strong> A candidate repeats the same tool and arguments in the same turn after a recorded failure. Known overlapping executions are excluded. This is a heuristic, not proof of a retry or avoidable work; successful polling is not flagged.</li>
+        <li id="note-3"><strong>Timing.</strong> Calls can overlap, so recorded durations cannot be added to obtain wall time. A wrapper returning establishes that output arrived, not that an inner execution succeeded.</li>
+        <li id="note-4"><strong>Accounting.</strong> Response records are preferred and deduplicated by response ID; snapshots are not added again. Older cumulative deltas can combine responses and approximate turn attribution. An inherited initial baseline is excluded. Matching session segments are merged; parent totals exclude child sessions. Outer model calls and inner executions remain separate layers.</li>
+        <li id="note-5"><strong>Context proxy.</strong> Response input includes instructions, history, files, and tool definitions. It approximates context size but does not measure exact live occupancy or isolate any source’s token contribution. Cumulative input is not context size.</li>
+        <li id="note-6"><strong>Account snapshots.</strong> Percentages and reset times are historical account-level observations, potentially including other chats or cloud work. Stale observations are marked; percentages must not be summed across sessions or buckets.</li>
+        <li id="note-7"><strong>Coverage.</strong> Compactions count committed checkpoints, excluding mirrored items. Coverage warnings identify unreadable, partial, or unsupported records. Activity absent from local logs remains unobserved.</li>
+        <li id="note-8"><strong>API-equivalent cost, not subscription charges.</strong> Dollar estimates use the catalog dated 2026-10-30 or your local overrides. Cached input and reasoning are not counted twice. Published long-context adjustments apply per response. Unknown models, unknown recorded tiers, missing counters, or cache writes without a known retention rate remain unpriced. A partial subtotal covers priced responses only. Scenario selectors apply the chosen API tier to every response; they do not change Codex or infer past subscription charges. Regional premiums and separate tool/service fees are excluded.</li>
+        <li id="note-9"><strong>Context change after tools.</strong> This is the signed change in input between consecutive logged responses in the same turn. It also includes assistant output and other context changes, so it is not a tool’s token cost. Intervals with multiple executions stay shared; compaction and model/effort changes suppress the proxy.</li>
+        <li id="note-10"><strong>Rates, windows, and projects.</strong> Tokens per execution and per turn-minute describe activity, not productivity. Reasoning share does not score answer quality. Calendar groups use recorded response times in your browser’s time zone, with Monday-start weeks. Window rows show local observed activity inside recorded account windows; account percentage slopes can include other activity and are not token-to-quota conversions. Raw working directories never reach the browser. Project labels and price overrides are stored only in this browser and excluded from metrics exports.</li>
+      </ol>
+    </details>
     <nav class="tabs" role="tablist" aria-label="Dashboard sections">
       <button id="tab-overview" role="tab" aria-selected="true" aria-controls="page-overview" data-page="overview">Overview</button>
       <button id="tab-sessions" role="tab" aria-selected="false" aria-controls="page-sessions" data-page="sessions" tabindex="-1">Sessions</button>
@@ -24,13 +39,24 @@
       <button id="tab-privacy" role="tab" aria-selected="false" aria-controls="page-privacy" data-page="privacy" tabindex="-1">Data &amp; privacy</button>
     </nav>
     <div id="page-overview" role="tabpanel" aria-labelledby="tab-overview">
-    <section class="hero"><div><span class="eyebrow">YOUR USAGE, EXPLAINED</span><h2>See the work behind every turn.</h2><p id="headline">Local measurements, from your own session logs.</p></div><div class="hero-note">All available history<span>Tokens measure activity.<br>Quota measures your allowance.</span></div></section>
+    <section class="hero"><div><span class="eyebrow">YOUR USAGE, EXPLAINED</span><h2>See the work behind every turn.</h2><p id="headline">Local measurements, from your own session logs.</p></div><div class="hero-note">All available history<span>Sessions · turns · executions</span></div></section>
+    <section class="panel">
+      <div class="section-heading"><h2>API-equivalent cost⁸</h2><label>Pricing basis <select id="pricing-speed"><option value="recorded">Recorded API tier</option><option value="standard">Standard scenario</option><option value="fast">Fast scenario</option><option value="ultrafast">Ultrafast scenario</option><option value="flex">Flex scenario</option></select></label></div>
+      <div id="cost-overview" class="cards"></div><p id="price-coverage" class="subtle"></p>
+      <details><summary>Rates, coverage &amp; local overrides</summary><p class="subtle">USD per million tokens. <a href="https://developers.openai.com/api/docs/pricing" target="_blank" rel="noreferrer">Official API pricing</a>, catalog checked 2026-10-30. These are current-rate comparisons, not historical invoices. Known model long-context multipliers still apply to overrides; overrides for unknown models are flat rates at all context sizes.</p><div id="price-table" class="table-wrap"></div>
+        <label for="price-overrides">Custom rates (JSON)</label><textarea id="price-overrides" rows="5" spellcheck="false" placeholder='{"my-model|fast":{"input":3,"cached":0.3,"output":15}}'></textarea>
+        <p class="subtle">Use exact model|tier keys. Optional cache_write supplies an explicit rate when retention is known to you. Applies immediately and stays in this browser.</p><button id="apply-prices">Apply overrides</button> <button id="reset-prices">Reset overrides</button><p id="price-status" role="status" class="subtle"></p>
+      </details>
+    </section>
     <section id="overview" class="cards" aria-label="Observed token totals"></section>
     <div class="two-column chart-layout">
-      <section class="panel"><div class="section-heading"><h2>What makes up your tokens?</h2><span class="tag">Recorded + derived shares</span></div><div id="token-mix" class="mix-layout"></div><p class="subtle">Reused input is context the model has seen before. Fresh input is the remaining input. Generated output includes reasoning. These three slices do not overlap.</p></section>
-      <section class="panel"><div class="section-heading"><h2>Activity over time</h2><span class="tag">Tokens by turn start date</span></div><div id="daily-chart" class="daily-chart"></div><p class="subtle">Each turn’s recorded usage is assigned to its start date in your browser’s time zone. A turn can span more than one day.</p><details><summary>View exact daily totals</summary><div id="daily-table" class="table-wrap"></div></details></section>
+      <section class="panel"><div class="section-heading"><h2>What makes up your tokens?</h2><span class="tag">Recorded + derived shares¹</span></div><div id="token-mix" class="mix-layout"></div></section>
+      <section class="panel"><div class="section-heading"><h2>Activity over time</h2><label>Group by <select id="period-group"><option value="day">Day</option><option value="week">Week</option><option value="month">Month</option></select></label></div><div id="daily-chart" class="daily-chart"></div><p class="subtle">All recorded periods are shown, grouped by response time in your browser’s time zone. Only periods with complete token counters are charted; the table includes coverage.</p><details><summary>View exact period totals</summary><div id="daily-table" class="table-wrap"></div></details></section>
     </div>
-    <section class="panel"><div class="section-heading"><h2>Account limit snapshots</h2><span class="tag">Measured · historical</span></div><div id="limits" class="limit-cards"></div><p class="subtle">Snapshots are read from logs, without contacting OpenAI. Reset times and percentages can be stale; never sum percentages across sessions or limit buckets.</p></section>
+    <section class="panel"><div class="section-heading"><h2>Cache health over time</h2><span class="tag">Weighted input share · measured change</span></div><div id="cache-trend" class="daily-chart"></div><div id="cache-health" class="table-wrap"></div></section>
+    <section class="panel"><div class="section-heading"><h2>Observed rate-limit windows¹⁰</h2><label>Window <select id="window-group"><option value="300">5-hour</option><option value="10080">Weekly</option><option value="all">All observed</option></select></label></div><div id="window-table" class="table-wrap"></div></section>
+    <section class="panel"><div class="section-heading"><h2>Reasoning by model and effort¹⁰</h2><span class="tag">Reasoning ÷ output</span></div><div id="reasoning-table" class="table-wrap"></div></section>
+    <section class="panel"><div class="section-heading"><h2>Account limit snapshots</h2><span class="tag">Measured · historical⁶</span></div><div id="limits" class="limit-cards"></div></section>
     <div class="two-column">
       <section class="panel"><div class="section-heading"><h2>Where tokens were recorded</h2><span class="tag">Measured</span></div><div id="kinds"></div><h3>Models used</h3><div id="models"></div></section>
       <section class="panel"><div class="section-heading"><h2>What to try next</h2><span class="tag">Evidence + hypothesis</span></div><div id="recommendations"></div></section>
@@ -38,8 +64,10 @@
     </div>
     <div id="page-sessions" role="tabpanel" aria-labelledby="tab-sessions" hidden>
     <div class="page-intro"><span class="eyebrow">FOLLOW THE WORK</span><h2>Find the sessions that use the most.</h2><p>Select a session to see its turns, context, and tool calls. Each turn is one stretch of assistant work.</p></div>
+    <section class="panel"><div class="section-heading"><h2>Projects¹⁰</h2><span class="tag">Hashed working directories · local labels</span></div><div id="projects" class="table-wrap"></div><p id="project-status" role="status" class="subtle"></p></section>
+    <section class="panel"><div class="section-heading"><h2>Compare turns¹⁰</h2><label>Sort <select id="turn-sort"><option value="cost">API-equivalent cost</option><option value="tokens">Tokens</option><option value="per-call">Tokens / execution</option><option value="per-minute">Tokens / minute</option></select></label></div><div id="turn-comparison" class="table-wrap"></div></section>
     <section class="panel">
-      <div class="section-heading"><h2>Sessions</h2><div class="filters"><label>Activity <select id="kind"><option value="all">All activity</option><option value="main">Main chats</option><option value="subagent">Subagents</option><option value="approval_subagent">Approval subagents</option></select></label><label>Model <select id="model"><option value="all">All models</option></select></label><label>Sort <select id="sort"><option value="updated">Recently active</option><option value="tokens">Most tokens</option></select></label></div></div>
+      <div class="section-heading"><h2>Sessions</h2><div class="filters"><label>Activity <select id="kind"><option value="all">All activity</option><option value="main">Main chats</option><option value="subagent">Subagents</option><option value="approval_subagent">Approval subagents</option></select></label><label>Project <select id="project-filter"><option value="all">All projects</option></select></label><label>Model <select id="model"><option value="all">All models</option></select></label><label>Sort <select id="sort"><option value="updated">Recently active</option><option value="tokens">Most tokens</option><option value="cost">Highest API-equivalent cost</option></select></label></div></div>
       <p class="subtle">Session labels are anonymous. Select a row to inspect turns, calls, and context. Totals cover all readable logs; filters affect this list only.</p>
       <div id="sessions" class="table-wrap"></div>
     </section>
@@ -47,39 +75,33 @@
       <div class="section-heading"><h2 id="detail-title">Session details</h2><button id="close-detail">Close</button></div>
       <div id="detail-meta" class="subtle"></div><div id="detail-warnings"></div>
       <div id="session-summary" class="cards"></div>
-      <h3>Input per response <span class="tag">Measured · context proxy</span></h3>
-      <p class="subtle">Input includes instructions, history, tool definitions, and other context. This is not an exact live context-window occupancy measure. Cumulative input is not context size.</p>
+      <h3>Session cache health</h3><div id="session-cache" class="daily-chart"></div>
+      <h3>Input per response <span class="tag">Measured⁵</span></h3>
+
       <div id="context-chart" class="chart"></div>
       <details><summary>View exact response input sizes</summary><div id="context-table" class="table-wrap"></div></details>
-      <h3>Per-turn token usage</h3><div id="turns" class="table-wrap"></div><p class="subtle">¹ Reasoning is included in output. ² Repeats are heuristic candidates. ³ Durations can overlap. ⁴ Cumulative fallback counts are usage updates, not verified response counts.</p>
+      <h3>Per-turn token usage</h3><div id="turns" class="table-wrap"></div>
       <h3>Tool invocation timeline</h3>
-      <p class="subtle">Outer model calls and inner executions are separate layers. Repeated identical arguments are retry candidates, not proven retries. Tool token cost is unavailable.</p>
-      <div class="filters"><label>Layer <select id="call-layer"><option value="all">All layers</option><option value="executed">Inner executions</option><option value="outer">Outer model calls</option><option value="mcp">MCP executions</option><option value="failed">Failed executions</option><option value="repeat">Repeat candidates</option></select></label><label>Turn <select id="call-turn"><option value="all">All turns</option></select></label></div>
+
+      <div class="filters"><label>Layer <select id="call-layer"><option value="all">All layers</option><option value="executed">Inner executions</option><option value="outer">Outer model calls</option><option value="mcp">MCP executions</option><option value="failed">Failed executions</option><option value="repeat">Repeats after failure²</option></select></label><label>Turn <select id="call-turn"><option value="all">All turns</option></select></label></div>
       <div id="timeline" class="table-wrap"></div><button id="more-calls" hidden>Show more calls</button>
-      <h3>Compaction checkpoints</h3><div id="compactions" class="table-wrap"></div>
+      <h3>Compaction checkpoints⁷</h3><div id="compactions" class="table-wrap"></div>
       <h3>Rate-limit history for this session</h3><div id="session-limits" class="table-wrap"></div>
     </section>
     </div>
     <div id="page-tools" role="tabpanel" aria-labelledby="tab-tools" hidden>
-    <div class="page-intro"><span class="eyebrow">UNDERSTAND THE ACTIONS</span><h2>What is the assistant doing?</h2><p>MCP tools connect to services. Shell commands and local tools operate on your computer. Calls measure activity; their token charges are not recorded separately.</p></div>
-    <div id="tool-cards" class="cards"></div>
+    <div class="page-intro"><span class="eyebrow">UNDERSTAND THE ACTIONS</span><h2>What is the assistant doing?</h2><p>MCP tools connect to services. Shell commands and local tools operate on your computer.</p></div>
+    <div id="tool-cards" class="cards execution-cards"></div>
+    <section class="panel"><div class="section-heading"><h2>Context change after tools⁹</h2><span class="tag">Signed input change · proxy</span></div><div id="tool-context" class="table-wrap"></div><details><summary>Inspect shared and excluded intervals</summary><div id="context-intervals" class="table-wrap"></div></details></section>
     <section class="panel"><div class="section-heading"><h2>Most-used MCP tools</h2><span class="tag">Execution counts</span></div><div id="mcp-chart"></div></section>
-    <section class="panel"><div class="section-heading"><h2>Tools &amp; MCP breakdown</h2><span class="tag">Measured executions</span></div><p class="subtle">Calls do not have independently recorded token charges. Outer call counts are listed separately to avoid adding wrapper calls to their inner executions.</p><div id="tools" class="table-wrap"></div><details><summary>Outer model calls</summary><div id="outer-tools" class="table-wrap"></div></details></section>
+    <section class="panel"><div class="section-heading"><h2>Tools &amp; MCP breakdown</h2><span class="tag">Measured executions</span></div><div id="tools" class="table-wrap"></div><details><summary>Outer model calls</summary><div id="outer-tools" class="table-wrap"></div></details></section>
     </div>
     <div id="page-privacy" role="tabpanel" aria-labelledby="tab-privacy" hidden>
-    <div class="page-intro"><span class="eyebrow">KNOW WHAT YOU ARE SEEING</span><h2>Measured, inferred, or unavailable?</h2><p>The dashboard labels its evidence so you can make decisions without mistaking token activity for subscription charges.</p></div>
-    <div class="evidence-grid"><article class="panel"><span class="evidence-dot measured"></span><h3>Measured</h3><p>Recorded token counters, models, executions, explicit failures, compaction checkpoints, and account-limit snapshots.</p></article><article class="panel"><span class="evidence-dot inferred"></span><h3>Derived or inferred</h3><p>Cache share is arithmetic. Context size is approximated by response input. Repeated arguments identify retry candidates, including intentional polling.</p></article><article class="panel"><span class="evidence-dot unknown"></span><h3>Unavailable</h3><p>Exact quota spent per session, tool token prices, plugin instruction overhead, and platform activity absent from local logs.</p></article></div>
-    <section class="notice"><strong>Your token counts and subscription allowance are separate measurements.</strong> Cached input is included in input; reasoning is included in output. Account snapshots may include other chats and cloud work. Exact quota consumed by each session is unavailable.</section>
+    <div class="page-intro"><span class="eyebrow">KNOW WHAT YOU ARE SEEING</span><h2>Measured, inferred, or unavailable?</h2><p>See the source, coverage, and confidence behind each measurement.</p></div>
+    <div class="evidence-grid"><article class="panel"><span class="evidence-dot measured"></span><h3>Measured</h3><p>Recorded token counters, models, executions, explicit failures, compaction checkpoints, and account-limit snapshots.</p></article><article class="panel"><span class="evidence-dot inferred"></span><h3>Derived or inferred</h3><p>Cache share and repeat candidates are derived from recorded events; possible causes require inspection.</p></article><article class="panel"><span class="evidence-dot unknown"></span><h3>Unavailable</h3><p>Fields the local logs do not expose; see measurement notes 1 and 7.</p></article></div>
     <section class="panel">
       <h2>Coverage &amp; privacy</h2><div id="coverage"></div><div id="config"></div>
-      <p class="subtle">The reader opens session logs and selected configuration fields read-only. Prompts, reasoning text, commands, arguments, outputs, file paths, account IDs, credentials, and environment variables are excluded. No database, analytics, external assets, API calls, or browser storage. Exports contain anonymous IDs, timestamps, model/tool names, and counts.</p>
-      <details>
-        <summary>How measurements are calculated</summary>
-        <p>Response records are preferred and deduplicated by response ID. Token-count snapshots are not added again. Older logs use cumulative deltas, which can combine several responses and cannot always attribute a turn precisely. An inherited first snapshot is shown as an excluded baseline. Missing values appear as —, never zero.</p>
-        <p>Reasoning and cached input are subsets; do not add them twice. Session totals cover the records present in the logs. Segments with the same session ID are combined. Response IDs are deduplicated. Parent and child sessions are separate; parent totals do not automatically include children.</p>
-        <p>Compaction counts use committed <code>compacted</code> events. Imported compaction response items are not counted a second time. Log formats may change; coverage warnings identify unsupported or partial data.</p>
-        <p>Subscription quota conversion, per-tool token costs, per-plugin prompt overhead, and hidden platform work remain unavailable. No token-to-quota estimates are invented.</p>
-      </details>
+      <p class="subtle">The reader opens session logs and selected configuration fields read-only. Prompts, reasoning text, commands, arguments, outputs, file paths, account IDs, credentials, and environment variables are excluded. No database, external assets, or outbound API calls. Only your project labels and pricing preferences are stored in this browser; access tokens remain in tab memory. Exports contain anonymous IDs, timestamps, model/tool names, and counts.</p>
     </section>
     </div>
   </main>

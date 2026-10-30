@@ -54,6 +54,44 @@ class LogTests(unittest.TestCase):
         self.assertEqual(session['usage_source'], 'token_usage_record')
         self.assertEqual(summarize([session, session])['usage']['total_tokens'], 120)
 
+    def test_response_analytics_metadata_is_hashed_and_historical(self):
+        events = self.base()
+        events[0]['payload']['cwd'] = '/PRIVATE_PROJECT'
+        events[2]['payload'].update(cwd='/PRIVATE_PROJECT', service_tier='fast')
+        events += [event('token_usage_record', {'response_id': 'PRIVATE_RESPONSE', 'turn_id': 'turn-one', 'usage': usage()}, 3),
+                   event('turn_context', {'turn_id': 'turn-two', 'model': 'other', 'effort': 'low', 'cwd': '/PRIVATE_OTHER', 'service_tier': 'default'}, 4),
+                   event('token_usage_record', {'response_id': 'PRIVATE_SECOND', 'turn_id': 'turn-two', 'usage': usage()}, 5)]
+        self.write(events)
+        snapshot = Observatory(self.root).snapshot()
+        session = snapshot['sessions'][0]
+        first, second = session['responses']
+        self.assertEqual(first['service_tier'], 'fast')
+        self.assertEqual(second['service_tier'], 'default')
+        self.assertNotEqual(first['project_id'], second['project_id'])
+        self.assertEqual(first['project_id'], session['turns'][0]['project_id'])
+        self.assertNotIn('PRIVATE_', json.dumps(snapshot))
+        self.assertNotIn('_fingerprint', json.dumps(snapshot))
+
+    def test_missing_tier_does_not_inherit_fast_pricing(self):
+        events = self.base()
+        events[2]['payload']['service_tier'] = 'fast'
+        events += [event('token_usage_record', {'response_id': 'fast', 'turn_id': 'turn-one', 'usage': usage()}, 3),
+                   event('turn_context', {'turn_id': 'turn-two', 'model': 'example', 'service_tier': None}, 4),
+                   event('token_usage_record', {'response_id': 'unknown', 'turn_id': 'turn-two', 'usage': usage()}, 5),
+                   event('turn_context', {'turn_id': 'turn-three', 'model': 'example'}, 6),
+                   event('token_usage_record', {'response_id': 'missing', 'turn_id': 'turn-three', 'usage': usage()}, 7)]
+        self.write(events)
+        self.assertEqual([record['service_tier'] for record in parse_session(self.path)['_records']], ['fast', 'unavailable', 'unavailable'])
+
+    def test_service_tier_only_exports_known_enum_values(self):
+        events = self.base()
+        events[2]['payload']['service_tier'] = '/PRIVATE_TIER'
+        events += [event('token_usage_record', {'response_id': 'one', 'turn_id': 'turn-one', 'usage': usage(), 'service_tier': '/PRIVATE_OVERRIDE'}, 3)]
+        self.write(events)
+        snapshot = Observatory(self.root).snapshot()
+        self.assertEqual(snapshot['sessions'][0]['responses'][0]['service_tier'], 'unavailable')
+        self.assertNotIn('PRIVATE_', json.dumps(snapshot))
+
     def test_fallback_deltas_repeated_snapshots_and_reset(self):
         events = self.base()
         for second, metrics in enumerate([usage(), usage(), usage(200, 120, 40, 10), usage(50, 30, 10, 2), usage(75, 40, 15, 3)], 3):
@@ -116,23 +154,113 @@ class LogTests(unittest.TestCase):
         self.assertEqual(session['calls'][0]['status'], 'returned')
         self.assertEqual(session['rate_limits'][0]['primary']['used_percent'], 80)
 
-    def test_identical_commands_are_candidates_not_retries(self):
+    def test_successful_polling_is_not_a_repeat_candidate(self):
         events = self.base()
         for second in (3, 4):
             events.append(event('event_msg', {'type': 'item_completed', 'turn_id': 'turn-one', 'item': {'type': 'CommandExecution', 'id': f'shell-{second}', 'command': ['pwd'], 'exit_code': 0}}, second))
         self.write(events)
         session = parse_session(self.path)
-        self.assertEqual([call['repeat_candidate'] for call in session['calls']], [False, True])
-        self.assertEqual(session['turns'][0]['repeated_calls'], 1)
+        self.assertEqual([call['repeat_candidate'] for call in session['calls']], [False, False])
+        self.assertEqual(session['turns'][0]['repeated_calls'], 0)
 
     def test_mcp_arguments_order_and_unavailable_output_bytes(self):
         events = self.base()
         for second, arguments in [(3, {'first': 1, 'second': 2}), (4, {'second': 2, 'first': 1})]:
-            events.append(event('event_msg', {'type': 'item_completed', 'turn_id': 'turn-one', 'item': {'type': 'McpToolCall', 'id': f'mcp-{second}', 'server': 'example', 'tool': 'read', 'arguments': arguments, 'status': 'completed'}}, second))
+            events.append(event('event_msg', {'type': 'item_completed', 'turn_id': 'turn-one', 'item': {'type': 'McpToolCall', 'id': f'mcp-{second}', 'server': 'example', 'tool': 'read', 'arguments': arguments, 'status': 'failed' if second == 3 else 'completed'}}, second))
         self.write(events)
         session = parse_session(self.path)
         self.assertEqual([call['repeat_candidate'] for call in session['calls']], [False, True])
         self.assertIsNone(summarize([session])['tools'][0]['output_bytes'])
+
+    def test_repeats_require_failure_and_do_not_cross_turns_or_overlap(self):
+        events = self.base()
+        for second, status, duration in ((3, 'failed', 100), (4, 'completed', 2000), (5, 'completed', 100), (6, 'failed', 100), (7, 'completed', 100), (8, 'completed', 100)):
+            events.append(event('event_msg', {'type': 'item_completed', 'turn_id': 'turn-one',
+                          'started_at_ms': 0, 'completed_at_ms': duration,
+                          'item': {'type': 'CommandExecution', 'id': f'call-{second}', 'command': ['pwd'], 'status': status}}, second))
+        events += [event('event_msg', {'type': 'task_started', 'turn_id': 'turn-two'}, 9),
+                   event('event_msg', {'type': 'item_completed', 'turn_id': 'turn-two', 'item': {'type': 'CommandExecution', 'id': 'new-turn', 'command': ['pwd'], 'exit_code': 0}}, 10)]
+        self.write(events)
+        snapshot = Observatory(self.root).snapshot()
+        self.assertEqual([call['repeat_candidate'] for call in snapshot['sessions'][0]['calls']], [False, False, False, False, True, False, False])
+        self.assertNotIn('_fingerprint', json.dumps(snapshot))
+
+    def test_failed_repeat_is_recalculated_across_segments(self):
+        self.write(self.base() + [event('event_msg', {'type': 'item_completed', 'turn_id': 'turn-one',
+                   'item': {'type': 'CommandExecution', 'id': 'failed', 'command': ['pwd'], 'exit_code': 1}}, 3)])
+        events = self.base() + [event('event_msg', {'type': 'item_completed', 'turn_id': 'turn-one',
+                  'item': {'type': 'CommandExecution', 'id': 'repeated', 'command': ['pwd'], 'exit_code': 0}}, 5)]
+        (self.logs / 'later.jsonl').write_text(''.join(json.dumps(item) + '\n' for item in events))
+        reader = Observatory(self.root)
+        for _ in range(2):
+            snapshot = reader.snapshot()
+            self.assertEqual([call['repeat_candidate'] for call in snapshot['sessions'][0]['calls']], [False, True])
+            self.assertNotIn('_fingerprint', json.dumps(snapshot))
+
+    def test_recommendations_require_comparable_outliers(self):
+        events = self.base()
+        for index, total in enumerate((100, 100, 100, 100, 100), 1):
+            events += [event('turn_context', {'turn_id': f'turn-{index}', 'model': 'example'}, index),
+                       event('token_usage_record', {'response_id': f'resp-{index}', 'turn_id': f'turn-{index}', 'usage': usage(total, 90, 0)}, index)]
+        self.write(events)
+        self.assertEqual(summarize([parse_session(self.path)])['recommendations'], [])
+        events[-1]['payload']['usage'] = usage(500, 450, 0)
+        self.write(events)
+        recommendations = summarize([parse_session(self.path)])['recommendations']
+        self.assertEqual(len(recommendations), 1)
+        self.assertIn('median', recommendations[0]['evidence'])
+        events[-2]['payload']['model'] = 'different-model'
+        self.write(events)
+        self.assertEqual(summarize([parse_session(self.path)])['recommendations'], [])
+
+    def test_cache_collapse_requires_sustained_valid_evidence(self):
+        events = self.base()
+        for index, cached in enumerate((9500, 9500, 9500, 1000, 1000, 1000), 3):
+            events.append(event('token_usage_record', {'response_id': f'resp-{index}', 'turn_id': 'turn-one', 'usage': usage(10000, cached, 0)}, index))
+        self.write(events[:-1])
+        self.assertEqual(summarize([parse_session(self.path)])['recommendations'], [])
+        self.write(events)
+        recommendations = summarize([parse_session(self.path)])['recommendations']
+        self.assertEqual(len(recommendations), 1)
+        self.assertIn('cache', recommendations[0]['title'].lower())
+        events[-1]['payload']['usage']['cached_input_tokens'] = None
+        self.write(events)
+        self.assertEqual(summarize([parse_session(self.path)])['recommendations'], [])
+
+    def test_duplicate_responses_do_not_supply_comparable_turns(self):
+        sessions = []
+        for index in range(5):
+            events = self.base()
+            events[0]['payload']['id'] = f'session-{index}'
+            events.append(event('token_usage_record', {'response_id': 'shared' if index < 4 else 'unique', 'turn_id': 'turn-one',
+                          'usage': usage(100 if index < 4 else 500, 0, 0)}, 3))
+            self.write(events)
+            sessions.append(parse_session(self.path))
+        summary = summarize(sessions)
+        self.assertEqual(summary['usage']['total_tokens'], 600)
+        self.assertEqual(summary['recommendations'], [])
+
+    def test_mixed_model_turns_do_not_supply_comparable_outliers(self):
+        events = self.base()
+        for index in range(5):
+            if index == 4:
+                events += [event('turn_context', {'turn_id': f'turn-{index}', 'model': 'other'}, 3),
+                           event('token_usage_record', {'response_id': 'other-response', 'turn_id': f'turn-{index}', 'usage': usage(400, 0, 0)}, 4)]
+            events += [event('turn_context', {'turn_id': f'turn-{index}', 'model': 'same'}, 5),
+                       event('token_usage_record', {'response_id': f'response-{index}', 'turn_id': f'turn-{index}', 'usage': usage(100, 0, 0)}, 6)]
+        self.write(events)
+        self.assertEqual(summarize([parse_session(self.path)])['recommendations'], [])
+
+    def test_lifecycle_updates_keep_valid_repeat_candidates(self):
+        events = self.base()
+        for second, call_id, status, duration in ((3, 'first', 'failed', 100), (4, 'second', 'in_progress', None), (10, 'second', 'completed', 6000)):
+            payload = {'type': 'item_completed', 'turn_id': 'turn-one', 'item': {'type': 'McpToolCall', 'id': call_id,
+                       'server': 'example', 'tool': 'read', 'arguments': {'key': 1}, 'status': status}}
+            if duration is not None:
+                payload.update(started_at_ms=0, completed_at_ms=duration)
+            events.append(event('event_msg', payload, second))
+        self.write(events)
+        self.assertEqual([call['repeat_candidate'] for call in parse_session(self.path)['calls']], [False, True])
 
     def test_refresh_after_append_and_unavailable_is_not_zero(self):
         self.write(self.base())

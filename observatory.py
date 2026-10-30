@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import statistics
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
@@ -40,6 +41,10 @@ def label(value, fallback='unavailable'):
     if re.search(r'(sk-|Bearer|token=|secret|password)', value, re.I):
         return fallback
     return value
+
+
+def service_tier(value):
+    return value if value in ('default', 'standard', 'fast', 'priority', 'ultrafast', 'flex', 'batch', 'auto') else 'unavailable'
 
 
 def identifier(value):
@@ -138,7 +143,7 @@ def session_stream(path):
 
 def parse_session(path):
     session = {'id': identifier(str(path)), 'parent_id': None, 'kind': 'main',
-               'started_at': None, 'updated_at': None, 'models': [], 'turns': [],
+               'started_at': None, 'updated_at': None, 'models': [], 'turns': [], 'project_id': None,
                'calls': [], 'compactions': [], 'rate_limits': [], 'context': [],
                'usage_source': 'unavailable', 'usage': empty_usage(),
                'reported_thread_usage': empty_usage(), 'warnings': [],
@@ -148,16 +153,16 @@ def parse_session(path):
     records = []
     fallback_records = []
     seen_records = set()
-    seen_items = set()
     outer_calls = {}
     output_events = []
     current_turn = None
     current_model = 'unavailable'
     current_effort = 'unavailable'
+    current_tier = 'unavailable'
+    current_project = None
     prior_total = None
     context_window = None
     inherited = False
-    repeat_fingerprints = {}
 
     def turn_for(raw_id=None, at=None):
         nonlocal current_turn
@@ -165,22 +170,18 @@ def parse_session(path):
         if turn_id not in turns:
             turns[turn_id] = {'id': turn_id, 'number': len(turns) + 1,
                              'started_at': at, 'ended_at': None, 'status': 'unavailable',
-                             'model': current_model, 'effort': current_effort,
+                             'model': current_model, 'effort': current_effort, 'service_tier': current_tier, 'project_id': current_project,
                              'usage': empty_usage(), 'responses': 0, 'tool_calls': 0,
                              'repeated_calls': 0, 'failed_calls': 0, 'compactions': 0}
         return turns[turn_id]
 
     def add_call(name, category, at, turn_id, status='unavailable', duration_ms=None,
                  output_bytes=None, fingerprint=None, item_id=None):
-        repeated = False
-        if fingerprint:
-            repeat_key = (turn_id, name, fingerprint)
-            repeated = repeat_key in repeat_fingerprints
-            repeat_fingerprints[repeat_key] = True
         call = {'at': at, 'turn_id': turn_id, 'name': label(name, 'redacted'),
                 'category': category, 'status': status, 'duration_ms': duration_ms,
-                'output_bytes': output_bytes, 'repeat_candidate': repeated,
+                'output_bytes': output_bytes, 'repeat_candidate': False, '_fingerprint': fingerprint,
                 'id': item_id, 'ended_at': at if status in ('completed', 'failed', 'cancelled') else None}
+        call['_started_at'] = dt.datetime.fromisoformat(at).timestamp() - (duration_ms or 0) / 1000 if at else None
         session['calls'].append(call)
         return call
 
@@ -217,15 +218,19 @@ def parse_session(path):
                 session['parent_id'] = identifier(payload.get('parent_thread_id') or spawn.get('parent_thread_id'))
                 if subagent or session['parent_id']:
                     session['kind'] = 'subagent'
+                current_project = identifier(payload.get('cwd')) or current_project
+                session['project_id'] = current_project
                 inherited = bool(payload.get('history_base'))
                 session['originator'] = label(payload.get('originator'), 'redacted')
                 session['log_version'] = label(payload.get('cli_version'))
             elif kind == 'turn_context':
                 current_model = label(payload.get('model'))
                 current_effort = label(payload.get('effort') or payload.get('reasoning_effort'))
+                current_tier = service_tier(payload.get('service_tier'))
+                current_project = identifier(payload.get('cwd')) or current_project
                 current_turn = identifier(payload.get('turn_id')) or current_turn
                 turn = turn_for(payload.get('turn_id'), at)
-                turn.update(model=current_model, effort=current_effort)
+                turn.update(model=current_model, effort=current_effort, service_tier=current_tier, project_id=current_project)
             elif kind == 'token_usage_record':
                 response_key = identifier(payload.get('response_id'))
                 if response_key and response_key in seen_records:
@@ -238,7 +243,8 @@ def parse_session(path):
                     continue
                 turn = turn_for(payload.get('turn_id'), at)
                 records.append({'id': response_key, 'at': at, 'turn_id': turn['id'], 'usage': usage,
-                                'model': turn['model'], 'effort': turn['effort'], 'context_window': context_window})
+                                'model': turn['model'], 'effort': turn['effort'], 'context_window': context_window,
+                                'service_tier': service_tier(payload.get('service_tier')) if 'service_tier' in payload else turn['service_tier'], 'project_id': turn['project_id']})
                 session['reported_thread_usage'] = usage_values(payload.get('thread_token_usage'))
             elif kind == 'event_msg':
                 if subtype == 'task_started':
@@ -288,9 +294,6 @@ def parse_session(path):
                     item = object_value(payload.get('item'))
                     item_type = label(item.get('type'))
                     item_id = identifier(item.get('id'))
-                    dedup_key = (item_type, item_id)
-                    duplicate_item = item_id and dedup_key in seen_items
-                    seen_items.add(dedup_key)
                     turn = turn_for(payload.get('turn_id'), at)
                     start_ms = number(payload.get('started_at_ms'))
                     end_ms = number(payload.get('completed_at_ms'))
@@ -303,7 +306,7 @@ def parse_session(path):
                             status = 'completed' if exit_code == 0 else 'failed'
                         output = item.get('aggregated_output')
                         output_size = len(output.encode()) if isinstance(output, str) else None
-                        fingerprint = None if duplicate_item else argument_fingerprint(item.get('command'))
+                        fingerprint = argument_fingerprint(item.get('command'))
                         add_call('shell.command', 'shell', at, turn['id'], status, duration, output_size, fingerprint, item_id)
                     elif item_type == 'McpToolCall':
                         name = label(item.get('server'), 'redacted') + '/' + label(item.get('tool'), 'redacted')
@@ -311,7 +314,7 @@ def parse_session(path):
                         if result.get('isError') is True or item.get('error'):
                             status = 'failed'
                         add_call(name, 'mcp', at, turn['id'], status, duration,
-                                 fingerprint=None if duplicate_item else argument_fingerprint(item.get('arguments')), item_id=item_id)
+                                 fingerprint=argument_fingerprint(item.get('arguments')), item_id=item_id)
                     elif item_type in ('FileChange', 'ImageView', 'Extension'):
                         add_call({'FileChange': 'file.change', 'ImageView': 'image.view', 'Extension': 'extension.' + label(item.get('kind'), 'unknown')}[item_type],
                                  'local' if item_type != 'Extension' else 'extension', at, turn['id'], status, duration, item_id=item_id)
@@ -324,6 +327,9 @@ def parse_session(path):
                     settings = object_value(payload.get('thread_settings'))
                     current_model = label(settings.get('model'), current_model)
                     current_effort = label(settings.get('reasoning_effort'), current_effort)
+                    current_tier = service_tier(settings.get('service_tier'))
+                    if current_turn in turns and turns[current_turn]['status'] == 'running':
+                        turns[current_turn].update(model=current_model, effort=current_effort, service_tier=current_tier)
                 elif subtype not in ('user_message', 'agent_message', 'agent_reasoning'):
                     session['unknown_events'] += 1
             elif kind == 'response_item':
@@ -382,8 +388,8 @@ def merge_lifecycle(previous, current):
     for key in ('at', 'started_at'):
         if key in merged:
             merged[key] = min((item[key] for item in (previous, current) if item.get(key)), default=None)
-    if 'repeat_candidate' in merged:
-        merged['repeat_candidate'] = previous['repeat_candidate'] or current['repeat_candidate']
+    if '_started_at' in merged:
+        merged['_started_at'] = min((item['_started_at'] for item in (previous, current) if item.get('_started_at') is not None), default=None)
     return merged
 
 
@@ -401,6 +407,17 @@ def recalculate_session(session):
             duration = seconds_between(call['at'], output['at'])
             call['duration_ms'] = duration * 1000 if duration is not None else None
     session['calls'] = sorted(calls.values(), key=lambda call: call['at'] or '')
+    prior_calls = {}
+    for call in session['calls']:
+        call['repeat_candidate'] = False
+        fingerprint = call.get('_fingerprint')
+        if not fingerprint:
+            continue
+        key = (call['turn_id'], call['category'], call['name'], fingerprint)
+        previous = prior_calls.get(key)
+        if previous and previous['status'] == 'failed' and previous['ended_at'] and call.get('_started_at') is not None:
+            call['repeat_candidate'] = dt.datetime.fromisoformat(previous['ended_at']).timestamp() < call['_started_at']
+        prior_calls[key] = call
     session['usage'] = empty_usage()
     turns = {turn['id']: turn for turn in session['turns']}
     for turn in turns.values():
@@ -476,6 +493,7 @@ def summarize(sessions):
     limits = []
     measured_sessions = 0
     duplicate_responses = 0
+    signal_records = collections.defaultdict(list)
     for session in sessions:
         measured_sessions += int(session['usage_source'] != 'unavailable')
         kind_usage = by_kind.setdefault(session['kind'], {'sessions': 0, 'usage': empty_usage()})
@@ -486,6 +504,7 @@ def summarize(sessions):
                 continue
             if record['id']:
                 seen_responses.add(record['id'])
+                signal_records[session['id']].append(record)
             add_usage(totals, record['usage'])
             add_usage(kind_usage['usage'], record['usage'])
             model = by_model.setdefault(record['model'], {'usage': empty_usage(), 'responses': 0})
@@ -511,27 +530,62 @@ def summarize(sessions):
     all_turns = [(session['id'], turn) for session in sessions for turn in session['turns']]
     largest = sorted(all_turns, key=lambda pair: pair[1]['usage']['total_tokens'] or 0, reverse=True)[:10]
     recommendations = []
-    if largest and largest[0][1]['usage']['total_tokens']:
-        session_id, turn = largest[0]
-        recommendations.append({'title': 'Start with the largest measured turns', 'evidence': f"Turn {turn['number']} in session {session_id[:8]} recorded {turn['usage']['total_tokens']:,} tokens across {turn['responses']} responses.",
-                                'action': 'Use the turn table to separate repeated context input from output. Scope the next task and compare before and after.', 'confidence': 'measured evidence; optimization hypothesis'})
-    context_inputs = [point['input_tokens'] for session in sessions for point in session['context'] if point['input_tokens'] is not None]
-    if context_inputs:
-        recommendations.append({'title': 'Watch repeated context input', 'evidence': f"Largest recorded response input: {max(context_inputs):,} tokens. Overall cache-hit share: {cache_ratio:.1%}." if cache_ratio is not None else f"Largest recorded response input: {max(context_inputs):,} tokens.",
-                                'action': 'For independent work, try a fresh chat with only relevant files. Input size is a context proxy, and cached input still counts in reported token totals.', 'confidence': 'measured evidence; optimization hypothesis'})
-    repeated = sum(tool['repeat_candidates'] for tool in tools.values())
-    failures = sum(tool['failed'] for tool in tools.values())
-    if repeated or failures:
-        recommendations.append({'title': 'Inspect repeated calls and failures', 'evidence': f'{repeated} repeated-call candidates and {failures} explicitly failed executions recorded.',
-                                'action': 'Review the timeline before changing the workflow. Repeated polling and repeated successful commands may be intentional; equality alone does not prove a retry.', 'confidence': 'heuristic candidates; measured failures'})
-    shell_bytes = sum(tool['output_bytes'] or 0 for tool in tools.values() if tool['category'] == 'shell')
-    if shell_bytes:
-        recommendations.append({'title': 'Keep command output focused', 'evidence': f'{shell_bytes:,} bytes of shell output recorded across these logs.',
-                                'action': 'Request narrower searches and concise output when the full content is unnecessary. Byte length does not establish how many output tokens entered model context.', 'confidence': 'measured bytes; token impact unavailable'})
-    approval = by_kind.get('approval_subagent')
-    if approval:
-        recommendations.append({'title': 'Separate approval activity', 'evidence': f"{approval['sessions']} approval subagent logs; {approval['usage']['total_tokens'] or 0:,} observed tokens.",
-                                'action': 'Keep these separate when comparing coding chats. Local logs do not establish whether approval tokens consume subscription allowance. Preserve necessary safety controls.', 'confidence': 'measured tokens; quota treatment unavailable'})
+    comparable = collections.defaultdict(list)
+    cache_drops = []
+    signal_sessions = set()
+    for session in sessions:
+        if session['usage_source'] != 'token_usage_record' or session['id'] in signal_sessions:
+            continue
+        signal_sessions.add(session['id'])
+        records = signal_records[session['id']]
+        turn_records = collections.defaultdict(list)
+        for record in records:
+            turn_records[record['turn_id']].append(record)
+        for turn in session['turns']:
+            contributing = turn_records[turn['id']]
+            if not contributing or any(record['usage']['total_tokens'] is None for record in contributing):
+                continue
+            if {(record['model'], record['effort']) for record in contributing} != {(turn['model'], turn['effort'])}:
+                continue
+            total = sum(record['usage']['total_tokens'] for record in contributing)
+            if total > 0:
+                measured = {**turn, 'usage': {**turn['usage'], 'total_tokens': total}}
+                comparable[(session['kind'], turn['model'], turn['effort'])].append((session['id'], measured))
+        recent = records[-6:]
+        if len(recent) != 6 or len({(record['model'], record['effort']) for record in recent}) != 1:
+            continue
+        usages = [record['usage'] for record in recent]
+        if any(u['input_tokens'] is None or u['input_tokens'] <= 0 or u['cached_input_tokens'] is None or
+               u['cached_input_tokens'] > u['input_tokens'] for u in usages):
+            continue
+        inputs = [sum(u['input_tokens'] for u in window) for window in (usages[:3], usages[3:])]
+        if min(inputs) < 10000:
+            continue
+        before = sum(u['cached_input_tokens'] for u in usages[:3]) / inputs[0]
+        after = sum(u['cached_input_tokens'] for u in usages[3:]) / inputs[1]
+        if before >= .8 and after <= .5 and before - after >= .3:
+            cache_drops.append((before - after, session['id'], before, after))
+    outliers = []
+    for group in comparable.values():
+        if len(group) < 5:
+            continue
+        median = statistics.median(turn['usage']['total_tokens'] for _, turn in group)
+        for session_id, turn in group:
+            ratio = turn['usage']['total_tokens'] / median
+            if ratio >= 5:
+                outliers.append((ratio, session_id, turn, median, len(group)))
+    if outliers:
+        ratio, session_id, turn, median, count = max(outliers, key=lambda item: item[0])
+        recommendations.append({'title': 'Inspect an unusually large turn',
+                                'evidence': f"Turn {turn['number']} in session {session_id[:8]} recorded {turn['usage']['total_tokens']:,} tokens, {ratio:.1f}× the median of {median:,.0f} across {count} turns with the same activity type, model, and effort.",
+                                'action': 'Inspect this turn for expanding context or repeated work before changing the workflow.',
+                                'confidence': 'measured outlier; cause requires inspection'})
+    if cache_drops:
+        _, session_id, before, after = max(cache_drops, key=lambda item: item[0])
+        recommendations.append({'title': 'Investigate a sustained cache-hit drop',
+                                'evidence': f"Session {session_id[:8]} fell from {before:.1%} cached input to {after:.1%} between its previous and latest three responses using the same model and effort.",
+                                'action': 'Inspect recent context changes and compaction checkpoints. This drop does not establish its cause or subscription impact.',
+                                'confidence': 'measured cache change; cause requires inspection'})
     return {'usage': totals, 'cache_ratio': cache_ratio, 'by_kind': by_kind, 'by_model': by_model,
             'tools': sorted(tools.values(), key=lambda tool: tool['calls'], reverse=True),
             'rate_limits': limits, 'measured_sessions': measured_sessions, 'duplicate_responses': duplicate_responses,
@@ -572,7 +626,11 @@ class Observatory:
                     self.cache.pop(path, None)
             sessions = merge_sessions([value[1] for value in self.cache.values()])
             summary = summarize(sessions)
-            public_sessions = [{key: value for key, value in session.items() if not key.startswith('_')} for session in sessions]
+            public_sessions = [{**{key: value for key, value in session.items() if not key.startswith('_')},
+                                'responses': session['_records'],
+                                'calls': [{**{key: value for key, value in call.items() if not key.startswith('_')},
+                                           'started_at_ms': call['_started_at'] * 1000 if call.get('_started_at') is not None else None}
+                                          for call in session['calls']]} for session in sessions]
             return {'generated_at': dt.datetime.now(dt.timezone.utc).isoformat(),
                     'privacy': 'Loopback only. Prompts, commands, arguments, outputs, paths, and secrets excluded. Memory storage.',
                     'coverage': {'sessions': len(sessions), 'log_files': len(self.cache), 'compressed_skipped': compressed, 'unreadable_files': unreadable,
